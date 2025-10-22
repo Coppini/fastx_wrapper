@@ -1,264 +1,443 @@
-#!/usr/bin/python3
+#!/usr/bin/env python3
 
-import sys
+import argparse
 import math
-from hashlib import sha1
-# from datetime import datetime
+from pathlib import Path
+from sys import stderr
+from typing import Any, Generator, Iterable
 
-class Sequence(object):
-    ''' This class is used for a sequence, determining it's header and sequence.'''
-    def __init__(self, header, seq):
-        self.header = header # Header of the sequence (it's "name")
-        self.seq = seq # The sequence itself (nucleotides/aminoacids)
-    
-    def __repr__(self):
-        return f"{self.header}\n{self.seq}" # Will return the header, a new line, and then the sequence. Notice that the > sign must be part of the header itself.
+import tqdm
+
+from fastx_io_wrapper import (
+    FASTA_EXTENSIONS,
+    FASTQ_EXTENSIONS,
+    GZIP_EXTENSIONS,
+    FastaFields,
+    FastaGenerator,
+    FastxFormat,
+    FastxIOWrapper,
+    PairedFastxIOWrapper,
+    QualitySimulator,
+)
+
+COMPLEMENT_DICT = {
+    "A": "T",
+    "C": "G",
+    "T": "A",
+    "G": "C",
+    "Y": "R",
+    "R": "Y",
+    "W": "W",
+    "S": "S",
+    "K": "M",
+    "M": "K",
+    "D": "H",
+    "V": "B",
+    "H": "D",
+    "B": "V",
+    "N": "N",
+    "X": "N",
+    "-": "-",
+}
+for key, value in list(COMPLEMENT_DICT.items()):
+    COMPLEMENT_DICT[key.lower()] = value.lower()
 
 
-''' # This function may be used in order to load the sequences onto the memory in the proper format before starting the job
-def load_fasta_file(path):
-    #'#''Loads a fasta file onto the memory (usually a multi-fasta). Will then load each sequence as a Sequence object inside an array.
-    Notice that newlines inside the sequence will be discarded, so that each sequence has only two lines:
-        HEADER [the greater sign (">") is part of the Header]
-        SEQUENCE [Everything that is not in the header's line, and before the next header]
-    As everything is loaded onto the memory, computers with low memory may have trouble with big files.'#''
-    contents = open(path).read().split("\n") # Opens the file and loads it onto the memory
-    sequences = [] 
-    current_sequence = Sequence("", "")
-    for line in contents: ### Parses through each line of the file loaded onto the memory, determining if they are Headers or Sequences, and loading them as such
-        if line.startswith(">"): # If the line starts with ">", consider it a header
-            sequences.append(current_sequence)
-            #'#''A header is the start of a new sequence, so before starting a new one, we first must append the previous sequence to our array.
-            Notice that this will generate an empty sequence ("","") at the first position in the array [0]. We will remove that later.'#''
-            current_sequence = Sequence("","") # Clearing the variable to load the next sequence in
-            current_sequence.header = line # Assigns the line as a header
-        else: # If the line doesn't start with ">", considers it as part of the sequence
-            current_sequence.seq += line # Adding the sequence to any previous lines that weren't headers (in the case of newlines inside the sequence itself)
-    sequences.append(current_sequence)
-    sequences[:1]="" # Removes the first sequence of the array, the empty sequence ("","") mentioned before.
-    contents = "" # Clears the variable from the memory. No need to keep our memory full.
-    return sequences '''
+def reverse_complement(seq: str) -> str:
+    return "".join(COMPLEMENT_DICT[base] for base in reversed(seq))
 
 
-def norepeat_splitter(bigseq, min_len):
-    '''This function splits fasta sequences (bigseq) into smaller sequences with a minimum defined length (min_len),
-    without repeating sequences (with no overlaps between each generated sequence).
-    Notice that the original sequences are split into smaller sequences with AT LEAST min_len, so if the original 
-    sequence (bigseq) is not a multiple of the min_len for the splitted sequences, the function will automatically
-    increase the length to make similar sized sequences. If the length of the bigseq is close to min_len, this can
-    yield splitted sequences with a maximum of 2x the given min_len.'''
-    norepeat_split_sequences = []
-    nseqs = int(len(bigseq.seq) / min_len) # Defines the number of smaller sequences generated from the given sequence (to have at least 'length' bases)
-    if nseqs == 0:
-        nseqs = 1
-        min_len = len(bigseq.seq)
-    remainder = len(bigseq.seq) % min_len # Calculates how many bases would remain after splitting into 'nseqs' with 'length' bases
-    while remainder / nseqs >= 1: ### While the remainder is bigger than the number of split sequences to generate, add bases to the length of every sequence
-        remainder = len(bigseq.seq) % min_len
-        min_len = int(min_len + ( remainder / nseqs ))  ### Adds the remainders to every sequence, to even them out. Notice that there still may be some remainder
-    end = 0
-    for i in range(nseqs - remainder): ### Creates sequences with the min_len defined by the previous loop
-        start = end # At which point the newly generated sequence will start
-        end = start + min_len # And where it will end
-        currentseq = Sequence(
-            f"{bigseq.header}_{i}_[{start}:{end}]", # Adds to the header of the sequence a number, as well as the start and end base in the original sequence
-            bigseq.seq[start:end]
-        )
-        print(currentseq)
-        ''' # To use instead of print if you want to hold it in the memory instead of printing it as soon as the sequence is processed.
-        norepeat_split_sequences.append(currentseq) '''
-    for i in range(nseqs - remainder , nseqs): # Adds an extra base to the last sequences generated, in order to include every sequence of the original bigseq
-        start = end
-        end = start + min_len + 1 # Adds 1 to the end, to include the remainders
-        currentseq = Sequence(
-            f"{bigseq.header}_{i}_[{start}:{end}]",
-            bigseq.seq[start:end]
-        )
-        print(currentseq)
-        ''' # To use instead of print if you want to hold it in the memory instead of printing it as soon as the sequence is processed.
-        norepeat_split_sequences.append(currentseq) '''
-    total = [s.seq for s in norepeat_split_sequences] # This will contain the entire sequence, in order to compare with the bigseq
-    assert "".join(total) == bigseq.seq , f"Error. Split sequences are not equal to original sequence for {bigseq.header}." # The comparison asserts every base is accounted for
-    return norepeat_split_sequences
+DEFAULT_WINDOW_SIZE = 150
+DEFAULT_COVERAGE = 1.0
+DEFAULT_QUALITY_SIMULATOR = QualitySimulator()
 
-def overlap_splitter(bigseq, fixed_len, overlap=0, coverage=0):
-    '''This function splits fasta sequences (bigseq) into smaller sequences of a fixed length (fixed_len),
-    making overlaps between each generated sequence (overlap). The user can give a specific amount of bases that
-    will overlap between one generated sequence and the next; or decide a coverage for the sequences, so that
-    the overlaps will be automatically calculated in order to generate the desired coverage.'''
-    index=set()
-    totalbpcount = len(bigseq.seq) # Calculates the total size of the sequence
-    if coverage > 1:
-        if coverage >= fixed_len: # In case the coverage is too big, fixes the 
-            coverage = fixed_len - 0.0001
-            gap = 1
-            overlap = fixed_len - gap
-        else:
-            overlap = fixed_len - int(fixed_len / coverage)
-    elif overlap > 0:
-        if overlap >= fixed_len:
-            overlap = fixed_len - 1
-            coverage = fixed_len - 0.001
-        else:
-            coverage = fixed_len / (fixed_len - overlap)
-    elif overlap <= 0 and coverage <= 1:
-        overlap = 0
-        coverage = 1
-    overlap_split_sequences = []
-    gap = fixed_len - overlap
-    if fixed_len >= totalbpcount:
-        currentseq = Sequence(
-            f"{bigseq.header}_{1}_[0:{totalbpcount}]",
-            bigseq.seq
-        )
+PairedFastaGenerator = Generator[
+    tuple[FastaFields, FastaFields], None, None
+]  # yields ((header, sequence), (header, sequence))
+
+
+def split_sequence_by_coverage_into_single(
+    sequence: str,
+    seq_number: int = 0,
+    header: str = "",
+    window_size: int = 150,
+    coverage: float = 1.0,
+) -> FastaGenerator:
+    seq_len = len(sequence)
+    window_size = min(seq_len, window_size)
+    n_windows = math.ceil((seq_len * coverage) / window_size)
+
+    if n_windows * window_size >= seq_len:
+        full_tiling = True
+        step = (seq_len - window_size) / max(1, n_windows - 1)
     else:
-        start = 0
-        end = fixed_len
-        i=1
-        Nseqs = math.ceil((totalbpcount - fixed_len) / gap)+1
-        restofrest = ((totalbpcount - fixed_len) % (Nseqs-1))
-        fullgap=(totalbpcount - fixed_len)/(Nseqs - 1)
-        while end < totalbpcount:
-            while (i <= (restofrest + 1)) and (end < totalbpcount):
-                currentseq = Sequence(
-                    f"{bigseq.header}_{i}_[{start}:{end}]", # Adds to the header of the sequence a number, as well as the start and end base in the original sequence
-                    bigseq.seq[start:end]
-                )
-                if sha1(currentseq.seq.encode('utf-8')).hexdigest() not in index: ### Avoids redundancy by testing if an identical sequence has already been generated
-                    print(currentseq)
-                    ''' # To use instead of print if you want to hold it in the memory instead of printing it as soon as the sequence is processed.
-                    overlap_split_sequences.append(currentseq) '''
-                    index.add(sha1(currentseq.seq.encode('utf-8')).hexdigest())
-                start = start + math.ceil((totalbpcount - fixed_len)/(Nseqs - 1))
-                end = start + fixed_len
-                i+=1
-            currentseq = Sequence(
-                f"{bigseq.header}_{i}_[{start}:{end}]", # Adds to the header of the sequence a number, as well as the start and end base in the original sequence
-                bigseq.seq[start:end]
-            )
-            if sha1(currentseq.seq.encode('utf-8')).hexdigest() not in index: ### Avoids redundancy by testing if an identical sequence has already been generated
-                print(currentseq)
-                ''' # To use instead of print if you want to hold it in the memory instead of printing it as soon as the sequence is processed.
-                overlap_split_sequences.append(currentseq) '''
-                index.add(sha1(currentseq.seq.encode('utf-8')).hexdigest())
-            start = start + int((totalbpcount - fixed_len)/(Nseqs - 1))
-            end = start + fixed_len
-            i+=1
-        currentseq = Sequence(
-            f"{bigseq.header}_{i}_[{totalbpcount - fixed_len}:{totalbpcount}]", # Adds to the header of the sequence a number, as well as the start and end base in the original sequence
-            bigseq.seq[start:end]
-        )
-    if sha1(currentseq.seq.encode('utf-8')).hexdigest() not in index: ### Avoids redundancy by testing if an identical sequence has already been generated
-        print(currentseq)
-        ''' # To use instead of print if you want to hold it in the memory instead of printing it as soon as the sequence is processed.
-        overlap_split_sequences.append(currentseq) '''
-        index.add(sha1(currentseq.seq.encode('utf-8')).hexdigest())
+        full_tiling = False
+        step = (seq_len - (n_windows * window_size)) / (n_windows + 1)
 
-    ''' # To use instead of print if you want to hold it in the memory instead of printing it as soon as the sequence is processed.
-    return overlap_split_sequences '''
+    for i in range(n_windows):
+        # start = int(round(((i + int(not full_tiling)) * step) + (window_size * int(not full_tiling) * i)))
+        start = int(
+            round((i * step) if full_tiling else ((i + 1) * step + (window_size * i)))
+        )
+        end = start + window_size
+        yield f"{seq_number}_{i}_{header}:{start}-{end}", sequence[start:end]
+        if end > seq_len:
+            raise RuntimeError(
+                f"Calculated end position {end} is greater than sequence length {seq_len} for sequence {header}"
+            )
+    if full_tiling and end < seq_len:
+        raise RuntimeError(
+            f"Did not reach the end of the sequence for sequence {header}, the final position was {end}/{seq_len}"
+        )
+
+
+def split_sequence_by_coverage_into_pairs(
+    sequence: str,
+    seq_number: int = 0,
+    header: str = "",
+    window_size: int = 150,
+    coverage: float = 1.0,
+    gap_between_pair: int | None = None,  # negative for overlapping paired-ends
+) -> PairedFastaGenerator:
+    seq_len = len(sequence)
+    window_size = min(seq_len, window_size)
+    pair_bases = window_size * 2
+    n_pairs = math.ceil((seq_len * coverage) / pair_bases)
+
+    if gap_between_pair is None:
+        gap_between_pair = window_size
+    max_gap = int(max(0, (seq_len / 2) - window_size - coverage))
+    gap_between_pair = min(gap_between_pair, max_gap)
+    insert_size = min(seq_len - gap_between_pair, pair_bases + gap_between_pair)
+    gap_between_pair = insert_size - pair_bases  # adjust gap if near the end
+
+    if n_pairs * pair_bases >= seq_len:
+        full_tiling = True
+        step = (seq_len - insert_size) / max(1, n_pairs - 1)
+    else:
+        full_tiling = False
+        step = (seq_len - (n_pairs * insert_size)) / (n_pairs + 1)
+
+    for i in range(n_pairs):
+        # start = int(round(((i + int(not full_tiling)) * step) + (window_size * int(not full_tiling) * i)))
+        paired_start = int(
+            round((i * step) if full_tiling else ((i + 1) * step + (window_size * i)))
+        )
+        paired_end = paired_start + insert_size
+        paired_header = f"{seq_number}_{i}_{header}:{paired_start}-{paired_end}"
+        # paired_sequence = sequence[paired_start:paired_end]
+        # read1_sequence = paired_sequence[:window_size]
+        # read2_sequence = reverse_complement(paired_sequence[-window_size:])
+        read1_fields = (
+            f"{paired_header}/1",
+            sequence[paired_start : paired_start + window_size],
+        )
+        read2_fields = (
+            f"{paired_header}/2",
+            reverse_complement(sequence[paired_end - window_size : paired_end]),
+        )
+        if paired_end > seq_len:
+            raise RuntimeError(
+                f"Calculated end position {paired_end} is greater than sequence length {seq_len} for sequence {header}"
+            )
+        yield read1_fields, read2_fields
+    if full_tiling and paired_end < seq_len:
+        raise RuntimeError(
+            f"Did not reach the end of the sequence for sequence {header}, the final position was {paired_end}/{seq_len}"
+        )
+
+
+def positive_int_window_size(window_size: str) -> int:
+    s_window_size = str(window_size).strip().lower()
+    i_window_size = int(s_window_size.replace("bp", ""))
+    if i_window_size <= 0:
+        raise argparse.ArgumentTypeError(
+            "Window-size must be an integer greater than 0."
+        )
+    return i_window_size
+
+
+def positive_float_coverage(coverage: str) -> float:
+    s_coverage = str(coverage).strip().lower().rstrip("x")
+    f_coverage = (
+        (float(s_coverage.rstrip("%")) / 100.0)
+        if s_coverage.endswith("%")
+        else float(s_coverage)
+    )
+    if f_coverage <= 0:
+        raise argparse.ArgumentTypeError(
+            "Coverage must be a float greater than 0."
+            " If you want to skip bases, you can use a decimal coverage,"
+            " with 'coverage < 0', but negative coverage does not exist."
+        )
+    return f_coverage
+
+
+def tqdm_iter(items: Iterable, verbose: bool = False, **kwargs) -> Iterable[Any]:
+    return tqdm.tqdm(items, **kwargs) if verbose else items
+
+
+def split_fasta_into_reads(
+    inp_io: FastxIOWrapper,
+    window_size: int = 150,
+    coverage: float = 1.0,
+    paired: bool = False,
+    gap_between_pair: int | None = None,  # negative for overlapping paired-ends
+) -> PairedFastaGenerator:
+    splitter_function = (
+        split_sequence_by_coverage_into_pairs
+        if paired
+        else split_sequence_by_coverage_into_single
+    )
+    settings = {"window_size": window_size, "coverage": coverage}
+    if paired:
+        settings["gap_between_pair"] = gap_between_pair
+    with inp_io as inp_fh:
+        for i, (header, sequence) in enumerate(inp_fh.iter_sequences()):
+            yield from splitter_function(
+                sequence=sequence,
+                seq_number=i,
+                header=header,
+                **settings,
+            )
+
+
+def split_from_fasta_and_write(
+    inp_io: FastxIOWrapper,
+    out_io: FastxIOWrapper | PairedFastxIOWrapper,
+    window_size: int = 150,
+    coverage: float = 1.0,
+    paired: bool = False,
+    quality_simulator: QualitySimulator | None = None,
+    gap_between_pair: int | None = None,  # negative for overlapping paired-ends
+    verbose: bool = True,
+) -> tuple[int, int]:
+    with out_io as out_fh:
+        results = out_fh.write_fastx(
+            sequences=tqdm_iter(
+                split_fasta_into_reads(
+                    inp_io=inp_io,
+                    window_size=window_size,
+                    coverage=coverage,
+                    paired=paired,
+                    gap_between_pair=gap_between_pair,
+                ),
+                verbose=verbose,
+                desc="Splitting sequences",
+            ),
+            quality_simulator=quality_simulator,
+        )
+        out_fh.flush()
+        return results
+
+
+def determine_output_format(args: argparse.Namespace) -> FastxFormat | None:
+    if args.fastq_mode:
+        return FastxFormat.FASTQ
+    if args.fasta_mode:
+        return FastxFormat.FASTA
+    if not (args.output or args.paired_output) or str(args.output) == "-":
+        return FastxFormat.FASTA
+
+    output_path = args.paired_output[0] if args.paired_output else args.output
+    out_suffix = output_path.suffix.lower()
+    if out_suffix in FASTQ_EXTENSIONS:
+        return FastxFormat.FASTQ
+    if out_suffix in GZIP_EXTENSIONS:
+        out_suffix = output_path.with_suffix("").suffix.lower()
+        if out_suffix in FASTQ_EXTENSIONS:
+            return FastxFormat.FASTQ
+        elif out_suffix in FASTA_EXTENSIONS:
+            return FastxFormat.FASTA
+    return None
+
 
 if __name__ == "__main__":
-#    start=datetime.now()
-    coverage = 0
-    overlap = 0
-    length = 0
-    sequences = []
-    if len(sys.argv) > 2:
-        length = int(sys.argv[2]) # The desired length for your split sequences (min_len)
 
-        if len(sys.argv) > 3:       # Tests if an overlap or coverage value was given
-            if sys.argv[3].startswith("-o="):
-                overlap = sys.argv[3][3:]
-                coverage = 0
-            elif sys.argv[3].startswith("--o="):
-                overlap = sys.argv[3][4:]
-                coverage = 0
-            elif sys.argv[3].startswith("-overlap="):
-                overlap = sys.argv[3][9:]
-                coverage = 0
-            elif sys.argv[3].startswith("--overlap="):
-                overlap = sys.argv[3][10:]
-                coverage = 0
-            elif sys.argv[3].startswith("-c="):
-                overlap = 0
-                coverage = sys.argv[3][3:]
-            elif sys.argv[3].startswith("--c="):
-                overlap = 0
-                coverage = sys.argv[3][4:]
-            elif sys.argv[3].startswith("--cov="):
-                overlap = 0
-                coverage = sys.argv[3][6:]
-            elif sys.argv[3].startswith("-cov="):
-                overlap = 0
-                coverage = sys.argv[3][5:]
-            elif sys.argv[3].startswith("-coverage="):
-                overlap = 0
-                coverage = sys.argv[3][10:]
-            elif sys.argv[3].startswith("--coverage="):
-                overlap = 0
-                coverage = sys.argv[3][11:]
-            else:
-                overlap = sys.argv[3]
-            if len(sys.argv) > 4: 
-                if sys.argv[4].startswith("-o="):
-                    overlap = sys.argv[4][3:]
-                elif sys.argv[4].startswith("--o="):
-                    overlap = sys.argv[4][4:]
-                elif sys.argv[4].startswith("-overlap="):
-                    overlap = sys.argv[4][9:]
-                elif sys.argv[4].startswith("--overlap="):
-                    overlap = sys.argv[4][10:]
-                elif sys.argv[4].startswith("-c="):
-                    coverage = sys.argv[4][3:]
-                elif sys.argv[4].startswith("--c="):
-                    coverage = sys.argv[4][4:]
-                elif sys.argv[4].startswith("--cov="):
-                    coverage = sys.argv[4][6:]
-                elif sys.argv[4].startswith("-cov="):
-                    coverage = sys.argv[4][5:]
-                elif sys.argv[4].startswith("-coverage="):
-                    coverage = sys.argv[4][10:]
-                elif sys.argv[4].startswith("--coverage="):
-                    coverage = sys.argv[4][11:]
-                else:
-                    coverage = sys.argv[4]
-        else:
-            overlap = 0
-            coverage = 0
-    else:
-        print("You need to provide a `Fasta File` and a `Length` to work with.\nUsage:\n\tpython3 Splitter.py <Fasta File> <Length> <Overlap> <Coverage>")
-        sys.exit()
+    def _require_together(
+        args, parser: argparse.ArgumentParser, required: str, dependent: str
+    ) -> None:
+        if getattr(args, dependent) and getattr(args, required) is None:
+            parser.error(
+                f"--{dependent.replace('_', '-')} requires --{required.replace('_', '-')}"
+            )
 
-    overlap=int(overlap)
-    coverage=float(coverage)
+    parser = argparse.ArgumentParser(
+        description="Split FASTA sequences into smaller sequences."
+    )
+    parser.add_argument(
+        "-i",
+        "--input",
+        required=True,
+        type=Path,
+        help="Input FASTA file",
+    )
 
-    # print(f"Length={length},\nOverlap={overlap},\nCoverage={coverage})")
+    parser.add_argument(
+        "-w",
+        "--window-size",
+        "--length",
+        "-l",
+        default=DEFAULT_WINDOW_SIZE,
+        type=positive_int_window_size,
+        help=f"Desired window_size for split sequences (must be > 0) [default: {DEFAULT_WINDOW_SIZE}]",
+    )
+    parser.add_argument(
+        "-c",
+        "--coverage",
+        "--min-coverage",
+        type=positive_float_coverage,
+        default=DEFAULT_COVERAGE,
+        help=f"Minimum coverage desired for the sequences [default: {DEFAULT_COVERAGE}]",
+    )
 
-#'#'#'# If you want to withhold sequences from output until all of them are processed, replace the section of code directly below with the next one.####
-    contents = open(sys.argv[1]).read().split("\n") # Opens the file and loads it onto the memory
+    verbosity_group = parser.add_mutually_exclusive_group()
+    verbosity_group.add_argument(
+        "--verbose", action="store_true", help="Show progress bar"
+    )
+    verbosity_group.add_argument(
+        "--quiet", action="store_true", help="Hide progress bar"
+    )
 
-    sequences = [] 
-    current_sequence = Sequence("", "")
-    for line in contents: ### Parses through each line of the file loaded onto the memory, determining if they are Headers or Sequences, and loading them as such
-        if line.startswith(">"): # If the line starts with ">", consider it a header
-            if current_sequence.header and current_sequence.seq: # If there was a sequence already loaded
-                overlap_splitter(current_sequence, length, overlap, coverage)
-            current_sequence = Sequence("","") # Clearing the variable to load the next sequence in
-            current_sequence.header = line # Assigns the line as a header
-        else: # If the line doesn't start with ">", considers it as part of the sequence
-            current_sequence.seq += line # Adding the sequence to any previous lines that weren't headers (in the case of newlines inside the sequence itself)
-    overlap_splitter(current_sequence, length, overlap, coverage)   
-    contents = ""
-#### If you want to withhold sequences from output until all of them are processed, replace the section of code directly above with the next (below) one.#'#'#'#
+    output_group = parser.add_mutually_exclusive_group()
+    output_group.add_argument(
+        "-o",
+        "--output",
+        type=Path,
+        help="Output FASTA file (if not provided, will print to STDOUT)",
+    )
+    output_group.add_argument(
+        "-p",
+        "--paired-output",
+        "--paired",
+        type=Path,
+        nargs=2,
+        help="If provided, generates two files with paired sequences (e.g. for paired-end reads). Two filepaths must be provided.",
+    )
 
-    ''' # Uses extra memory. Not recommended. Use this if you're using the load_fasta_file function.
-    This will withhold the sequences until all of them are processed, before sending them to the standard output. You may use this in a program if you want
-    all the sequences to be written to output at the same time, instead of one by one as they are processed.
-    # sequences = load_fasta_file(sys.argv[1]) # Loads your fasta file (see function load_fasta_file), with the original sequences (bigseq's), into an array of Sequences. # 
-    for curseq in sequences:
-        # splitted = norepeat_splitter(curseq,length) # Splits one of the original sequences, making an array with multiple smaller sequences
-        splitted = overlap_splitter(curseq,length,overlap,coverage)
-        for s in splitted:
-            print(s) # Each split sequence in the generated array is printed
-        splitted=[] '''
-#    print(datetime.now() - start)
+    fast_group = parser.add_mutually_exclusive_group()
+    fast_group.add_argument(
+        "-f",
+        "--fastq-mode",
+        "--fastq",
+        action="store_true",
+        help="If provided, outputs in FASTQ format with dummy quality scores (by default, outputs FASTA unless output filename ends with .fq/.fastq).",
+    )
+    fast_group.add_argument(
+        "-a",
+        "--fasta-mode",
+        "--fasta",
+        action="store_true",
+        help="If provided, outputs in FASTA format (by default, outputs FASTA unless output filename ends with .fq/.fastq).",
+    )
+
+    parser.add_argument(
+        "-g",
+        "--gap-between-pair",
+        type=int,
+        default=None,
+        help="Gap between the two reads when using paired mode. If negative, reads will overlap. [default: same as window_size]",
+    )
+
+    quality_group = parser.add_argument_group(
+        title="Quality score simulation options",
+        description="Options for simulating quality scores when outputting FASTQ files.",
+    )
+    quality_group.add_argument(
+        "--mean-q",
+        type=int,
+        default=DEFAULT_QUALITY_SIMULATOR.mean_q,
+        help=f"Mean quality score for simulated FASTQ [default: {DEFAULT_QUALITY_SIMULATOR.mean_q}]",
+    )
+    quality_group.add_argument(
+        "--stdev-q",
+        type=float,
+        default=DEFAULT_QUALITY_SIMULATOR.stdev_q,
+        help=f"Standard deviation of quality scores [default: {DEFAULT_QUALITY_SIMULATOR.stdev_q}]",
+    )
+    quality_group.add_argument(
+        "--min-q",
+        type=int,
+        default=DEFAULT_QUALITY_SIMULATOR.min_q,
+        help=f"Minimum quality score [default: {DEFAULT_QUALITY_SIMULATOR.min_q}]",
+    )
+    quality_group.add_argument(
+        "--max-q",
+        type=int,
+        default=DEFAULT_QUALITY_SIMULATOR.max_q,
+        help=f"Maximum quality score [default: {DEFAULT_QUALITY_SIMULATOR.max_q}]",
+    )
+    quality_group.add_argument(
+        "--max-start-decay",
+        type=int,
+        default=DEFAULT_QUALITY_SIMULATOR.max_start_decay,
+        help=f"Maximum decay at start of read [default: {DEFAULT_QUALITY_SIMULATOR.max_start_decay}]",
+    )
+    quality_group.add_argument(
+        "--max-end-decay",
+        type=int,
+        default=DEFAULT_QUALITY_SIMULATOR.max_end_decay,
+        help=f"Maximum decay at end of read [default: {DEFAULT_QUALITY_SIMULATOR.max_end_decay}]",
+    )
+    quality_group.add_argument(
+        "--phred-offset",
+        type=int,
+        default=DEFAULT_QUALITY_SIMULATOR.phred_offset,
+        help=f"PHRED offset for quality scores [default: {DEFAULT_QUALITY_SIMULATOR.phred_offset}]",
+    )
+
+    args = parser.parse_args()
+
+    _require_together(
+        args, parser, required="paired_output", dependent="gap_between_pair"
+    )
+
+    window_size = args.window_size
+    coverage = args.coverage
+    verbose = args.verbose or (not args.quiet and str(args.output) != "-")
+
+    paired = bool(args.paired_output)
+    if args.gap_between_pair is not None and not paired:
+        print(
+            "WARNING: --gap-between-pair is ignored when not using paired mode.",
+            file=stderr,
+        )
+
+    inp_io = FastxIOWrapper(file=args.input, mode="rt")
+    if inp_io.fastx_format is None:
+        inp_io.fastx_format = FastxFormat.FASTA
+    output_fastx_format = determine_output_format(args)
+    out_io = (
+        PairedFastxIOWrapper(
+            read1_io=FastxIOWrapper(
+                file=args.paired_output[0], mode="wt", fastx_format=output_fastx_format
+            ),
+            read2_io=FastxIOWrapper(
+                file=args.paired_output[1], mode="wt", fastx_format=output_fastx_format
+            ),
+        )
+        if paired
+        else FastxIOWrapper(
+            file=args.output, mode="wt", fastx_format=output_fastx_format
+        )
+    )
+    quality_simulator = QualitySimulator(
+        mean_q=args.mean_q,
+        stdev_q=args.stdev_q,
+        min_q=args.min_q,
+        max_q=args.max_q,
+        max_start_decay=args.max_start_decay,
+        max_end_decay=args.max_end_decay,
+        phred_offset=args.phred_offset,
+    )
+
+    split_from_fasta_and_write(
+        inp_io=inp_io,
+        out_io=out_io,
+        window_size=window_size,
+        coverage=coverage,
+        paired=paired,
+        quality_simulator=quality_simulator,
+        gap_between_pair=args.gap_between_pair,
+        verbose=verbose,
+    )
